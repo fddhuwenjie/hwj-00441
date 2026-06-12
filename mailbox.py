@@ -1159,44 +1159,50 @@ class MailClient:
         if not tmpl:
             print(f"  Error: Template '{name}' not found.")
             return
-        vars = self._default_template_vars()
-        subject = self._apply_template_vars(tmpl["subject"], vars)
-        body = self._apply_template_vars(tmpl["body"], vars)
         print(f"  Using template: {name}")
         print("  Compose new email (pre-filled from template)")
-        to_input = input("  To: ").strip()
+        try:
+            to_input = input("  To: ").strip()
+        except EOFError:
+            print("\n  Compose cancelled.")
+            return
         if to_input.lower() == "cancel":
             print("  Compose cancelled.")
             return
-        cc_input = input("  CC: ").strip()
+        recipient_username = None
+        to_addrs = self._parse_recipients(to_input)
+        if to_addrs:
+            first_addr = to_addrs[0]
+            recip = self._get_user_by_email(first_addr)
+            if recip:
+                recipient_username = recip["username"]
+        vars = self._default_template_vars(recipient_username=recipient_username)
+        subject = self._apply_template_vars(tmpl["subject"], vars)
+        body = self._apply_template_vars(tmpl["body"], vars)
+        try:
+            cc_input = input("  CC: ").strip()
+        except EOFError:
+            print("\n  Compose cancelled.")
+            return
         if cc_input.lower() == "cancel":
             print("  Compose cancelled.")
             return
         subject_default = subject if subject else ""
-        subject_input = input(f"  Subject [{subject_default}]: ").strip()
+        try:
+            subject_input = input(f"  Subject [{subject_default}]: ").strip()
+        except EOFError:
+            print("\n  Compose cancelled.")
+            return
         if subject_input.lower() == "cancel":
             print("  Compose cancelled.")
             return
         final_subject = subject_input if subject_input else subject_default
-        print("  Body (end with '.' on a single line; '.' alone uses template body):")
-        print(f"  --- Template body preview ---")
-        for line in body.split("\n")[:5]:
-            print(f"  > {line}")
-        if len(body.split("\n")) > 5:
-            print(f"  > ... ({len(body.split(chr(10))) - 5} more lines)")
-        print(f"  -----------------------------")
-        body_lines = []
-        while True:
-            try:
-                line = input("  > ")
-            except EOFError:
-                break
-            if line == ".":
-                break
-            body_lines.append(line)
-        final_body = "\n".join(body_lines) if body_lines else body
         attachments = []
-        attach_input = input("  Attachments (file paths, comma-separated; Enter to skip): ").strip()
+        try:
+            attach_input = input("  Attachments (file paths, comma-separated; Enter to skip): ").strip()
+        except EOFError:
+            print("\n  Compose cancelled.")
+            return
         if attach_input.lower() == "cancel":
             print("  Compose cancelled.")
             return
@@ -1217,6 +1223,23 @@ class MailClient:
                     print(f"    Attached: {fname} ({self._fmt_size(len(data))})")
                 except Exception as e:
                     print(f"    Error reading file, skipped: {fpath} ({e})")
+        print("  Body (end with '.' on a single line; '.' alone uses template body):")
+        print(f"  --- Template body preview ---")
+        for line in body.split("\n")[:5]:
+            print(f"  > {line}")
+        if len(body.split("\n")) > 5:
+            print(f"  > ... ({len(body.split(chr(10))) - 5} more lines)")
+        print(f"  -----------------------------")
+        body_lines = []
+        while True:
+            try:
+                line = input("  > ")
+            except EOFError:
+                break
+            if line == ".":
+                break
+            body_lines.append(line)
+        final_body = "\n".join(body_lines) if body_lines else body
         self._send_email(to_input, cc_input, final_subject, final_body, attachments)
 
     def _do_template_delete(self, args):
