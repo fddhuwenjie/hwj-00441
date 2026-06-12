@@ -330,6 +330,28 @@ class MailClient:
         if subject.lower() == "cancel":
             print("  Compose cancelled.")
             return
+        attachments = []
+        attach_input = input("  Attachments (file paths, comma-separated; Enter to skip): ").strip()
+        if attach_input.lower() == "cancel":
+            print("  Compose cancelled.")
+            return
+        if attach_input:
+            for fpath in attach_input.split(","):
+                fpath = fpath.strip().strip("'\"")
+                if not fpath:
+                    continue
+                if not os.path.isfile(fpath):
+                    print(f"    File not found, skipped: {fpath}")
+                    continue
+                try:
+                    with open(fpath, "rb") as f:
+                        data = f.read()
+                    b64 = base64.b64encode(data).decode("utf-8")
+                    fname = os.path.basename(fpath)
+                    attachments.append({"filename": fname, "data_base64": b64, "size": len(data)})
+                    print(f"    Attached: {fname} ({self._fmt_size(len(data))})")
+                except Exception as e:
+                    print(f"    Error reading file, skipped: {fpath} ({e})")
         print("  Body (end with a single '.' on a line):")
         body_lines = []
         while True:
@@ -341,55 +363,7 @@ class MailClient:
                 break
             body_lines.append(line)
         body = "\n".join(body_lines)
-
-        attachments = []
-        while True:
-            cmd = input("  compose> ").strip()
-            if not cmd:
-                continue
-            parts = cmd.split(maxsplit=1)
-            action = parts[0].lower()
-            if action == "send":
-                self._send_email(to_input, cc_input, subject, body, attachments)
-                break
-            elif action == "draft":
-                self._save_draft(to_input, cc_input, subject, body, attachments)
-                break
-            elif action == "attach":
-                if len(parts) < 2:
-                    print("    Usage: attach <file_path>")
-                    continue
-                fpath = parts[1].strip().strip("'\"")
-                if not os.path.isfile(fpath):
-                    print(f"    Error: File not found: {fpath}")
-                    continue
-                try:
-                    with open(fpath, "rb") as f:
-                        data = f.read()
-                    b64 = base64.b64encode(data).decode("utf-8")
-                    fname = os.path.basename(fpath)
-                    attachments.append({"filename": fname, "data_base64": b64, "size": len(data)})
-                    print(f"    Attached: {fname} ({self._fmt_size(len(data))})")
-                except Exception as e:
-                    print(f"    Error reading file: {e}")
-            elif action == "attachments":
-                if not attachments:
-                    print("    No attachments.")
-                else:
-                    for i, att in enumerate(attachments, 1):
-                        print(f"    {i}. {att['filename']} ({self._fmt_size(att['size'])})")
-            elif action in ("cancel", "quit", "exit"):
-                print("  Compose cancelled.")
-                break
-            elif action == "help":
-                print("    send       - Send the email")
-                print("    draft      - Save as draft")
-                print("    attach     - Attach a file: attach <path>")
-                print("    attachments - List current attachments")
-                print("    cancel     - Cancel composing")
-                print("    help       - Show this help")
-            else:
-                print(f"    Unknown command: {action}. Type 'help' for options.")
+        self._send_email(to_input, cc_input, subject, body, attachments)
 
     def _parse_recipients(self, addr_str):
         if not addr_str.strip():
