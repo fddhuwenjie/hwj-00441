@@ -5,11 +5,19 @@ import hashlib
 import base64
 import os
 import shutil
+import json
+import re
+import fnmatch
+import argparse
 from datetime import datetime, timedelta
+from cryptography.hazmat.primitives import hashes, serialization
+from cryptography.hazmat.primitives.asymmetric import rsa, padding
+from cryptography.hazmat.backends import default_backend
 
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "mailserver.db")
 DOMAIN = "local.mail"
 TRASH_RETENTION_DAYS = 30
+RSA_KEY_SIZE = 2048
 
 
 class MailClient:
@@ -25,6 +33,7 @@ class MailClient:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self._create_tables()
+        self._migrate_existing_users_keys()
         self._seed_data()
 
     def _create_tables(self):
@@ -56,6 +65,10 @@ class MailClient:
                 folder_id INTEGER NOT NULL,
                 is_read INTEGER NOT NULL DEFAULT 0,
                 is_starred INTEGER NOT NULL DEFAULT 0,
+                is_encrypted INTEGER NOT NULL DEFAULT 0,
+                is_signed INTEGER NOT NULL DEFAULT 0,
+                signature TEXT,
+                encryption_key_id INTEGER,
                 created_at TEXT NOT NULL,
                 deleted_at TEXT,
                 FOREIGN KEY (sender_id) REFERENCES users(id),
@@ -70,11 +83,163 @@ class MailClient:
                 size INTEGER NOT NULL,
                 FOREIGN KEY (email_id) REFERENCES emails(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                priority INTEGER NOT NULL DEFAULT 0,
+                cond_from TEXT,
+                cond_subject TEXT,
+                cond_has_attachment INTEGER,
+                action_type TEXT NOT NULL,
+                action_param TEXT,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS templates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                subject TEXT NOT NULL DEFAULT '',
+                body TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                UNIQUE(user_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS user_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER UNIQUE NOT NULL,
+                public_key_pem TEXT NOT NULL,
+                private_key_pem TEXT NOT NULL,
+                key_fingerprint TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
         """)
         self.conn.commit()
 
     def _hash_password(self, password):
         return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+    def _generate_rsa_keypair(self):
+        private_key = rsa.generate_private_key(
+            public_exponent=65537,
+            key_size=RSA_KEY_SIZE,
+            backend=default_backend()
+        )
+        public_key = private_key.public_key()
+        private_pem = private_key.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption()
+        ).decode("utf-8")
+        public_pem = public_key.public_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        ).decode("utf-8")
+        der = public_key.public_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PublicFormat.SubjectPublicKeyInfo
+        )
+        fingerprint = hashlib.sha256(der).hexdigest()
+        return public_pem, private_pem, fingerprint
+
+    def _get_user_keys(self, user_id):
+        row = self.conn.execute(
+            "SELECT * FROM user_keys WHERE user_id = ?", (user_id,)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _load_public_key(self, pem_str):
+        return serialization.load_pem_public_key(
+            pem_str.encode("utf-8"), backend=default_backend()
+        )
+
+    def _load_private_key(self, pem_str):
+        return serialization.load_pem_private_key(
+            pem_str.encode("utf-8"), password=None, backend=default_backend()
+        )
+
+    def _encrypt_with_public_key(self, plaintext, public_key_pem):
+        pub_key = self._load_public_key(public_key_pem)
+        chunk_size = RSA_KEY_SIZE // 8 - 42
+        data = plaintext.encode("utf-8")
+        encrypted_chunks = []
+        for i in range(0, len(data), chunk_size):
+            chunk = data[i:i + chunk_size]
+            enc = pub_key.encrypt(
+                chunk,
+                padding.OAEP(
+                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                    algorithm=hashes.SHA256(),
+                    label=None
+                )
+            )
+            encrypted_chunks.append(base64.b64encode(enc).decode("utf-8"))
+        return json.dumps(encrypted_chunks)
+
+    def _decrypt_with_private_key(self, encrypted_json, private_key_pem):
+        priv_key = self._load_private_key(private_key_pem)
+        try:
+            chunks = json.loads(encrypted_json)
+        except (json.JSONDecodeError, TypeError):
+            return None
+        decrypted = b""
+        try:
+            for chunk_b64 in chunks:
+                chunk = base64.b64decode(chunk_b64)
+                dec = priv_key.decrypt(
+                    chunk,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
+                )
+                decrypted += dec
+            return decrypted.decode("utf-8")
+        except Exception:
+            return None
+
+    def _sign_data(self, data_str, private_key_pem):
+        priv_key = self._load_private_key(private_key_pem)
+        signature = priv_key.sign(
+            data_str.encode("utf-8"),
+            padding.PSS(
+                mgf=padding.MGF1(hashes.SHA256()),
+                salt_length=padding.PSS.MAX_LENGTH
+            ),
+            hashes.SHA256()
+        )
+        return base64.b64encode(signature).decode("utf-8")
+
+    def _verify_signature(self, data_str, signature_b64, public_key_pem):
+        try:
+            pub_key = self._load_public_key(public_key_pem)
+            signature = base64.b64decode(signature_b64)
+            pub_key.verify(
+                signature,
+                data_str.encode("utf-8"),
+                padding.PSS(
+                    mgf=padding.MGF1(hashes.SHA256()),
+                    salt_length=padding.PSS.MAX_LENGTH
+                ),
+                hashes.SHA256()
+            )
+            return True
+        except Exception:
+            return False
+
+    def _ensure_user_keys(self, user_id):
+        existing = self._get_user_keys(user_id)
+        if existing:
+            return
+        public_pem, private_pem, fingerprint = self._generate_rsa_keypair()
+        self.conn.execute(
+            "INSERT INTO user_keys (user_id, public_key_pem, private_key_pem, key_fingerprint, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, public_pem, private_pem, fingerprint, datetime.now().isoformat())
+        )
+        self.conn.commit()
 
     def _get_user_by_username(self, username):
         row = self.conn.execute(
@@ -137,6 +302,11 @@ class MailClient:
                 (cutoff,),
             )
         self.conn.commit()
+
+    def _migrate_existing_users_keys(self):
+        rows = self.conn.execute("SELECT id FROM users").fetchall()
+        for r in rows:
+            self._ensure_user_keys(r["id"])
 
     def _seed_data(self):
         count = self.conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
@@ -239,6 +409,7 @@ class MailClient:
         self.conn.commit()
         user_id = cursor.lastrowid
         self._ensure_system_folders(user_id)
+        self._ensure_user_keys(user_id)
         return user_id
 
     def do_register(self, args):
@@ -313,10 +484,24 @@ class MailClient:
             u = self.current_user
             print(f"  {self._email_addr(u['username'])}  (created: {u['created_at'][:19]})")
 
-    def do_compose(self, _args):
+    def do_compose(self, args):
         if not self.current_user:
             print("  Error: Not logged in.")
             return
+        encrypt = False
+        sign = False
+        remaining_args = args.strip()
+        for flag in ("--encrypt", "--sign"):
+            if flag in remaining_args.split():
+                if flag == "--encrypt":
+                    encrypt = True
+                elif flag == "--sign":
+                    sign = True
+                remaining_args = remaining_args.replace(flag, "").strip()
+        if encrypt:
+            print("  [加密模式] 邮件将使用收件人公钥加密")
+        if sign:
+            print("  [签名模式] 邮件将使用您的私钥签名")
         print("  Compose new email (enter fields below, or 'cancel' at any prompt)")
         to_input = input("  To: ").strip()
         if to_input.lower() == "cancel":
@@ -363,7 +548,8 @@ class MailClient:
                 break
             body_lines.append(line)
         body = "\n".join(body_lines)
-        self._send_email(to_input, cc_input, subject, body, attachments)
+        self._send_email(to_input, cc_input, subject, body, attachments,
+                         encrypt=encrypt, sign=sign)
 
     def _parse_recipients(self, addr_str):
         if not addr_str.strip():
@@ -376,9 +562,11 @@ class MailClient:
             result.append(addr.lower())
         return result
 
-    def _send_email(self, to_str, cc_str, subject, body, attachments):
+    def _send_email(self, to_str, cc_str, subject, body, attachments,
+                    encrypt=False, sign=False, per_recipient_vars=None):
         user_id = self.current_user["id"]
-        from_addr = self._email_addr(self.current_user["username"])
+        username = self.current_user["username"]
+        from_addr = self._email_addr(username)
         to_addrs = self._parse_recipients(to_str)
         cc_addrs = self._parse_recipients(cc_str)
         all_recipients = to_addrs + cc_addrs
@@ -386,19 +574,28 @@ class MailClient:
             print("  Error: No recipients specified.")
             return
         now = datetime.now().isoformat()
-        message_id = f"msg-{user_id}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
+        sender_keys = self._get_user_keys(user_id) if sign or encrypt else None
+        signature = None
+        if sign and sender_keys:
+            sign_data = f"{subject}\n{body}\n{from_addr}"
+            signature = self._sign_data(sign_data, sender_keys["private_key_pem"])
+        base_message_id = f"msg-{user_id}-{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
         sent_fid = self._get_folder_id(user_id, "sent")
         if sent_fid is None:
             sent_fid = self._get_or_create_folder(user_id, "sent")
         self._insert_email_copy(
-            message_id, user_id, from_addr, ", ".join(to_addrs), ", ".join(cc_addrs),
+            base_message_id, user_id, from_addr, ", ".join(to_addrs), ", ".join(cc_addrs),
             subject, body, user_id, sent_fid, is_read=1, created_at=now,
             attachments=attachments,
+            is_encrypted=1 if encrypt else 0,
+            is_signed=1 if sign else 0,
+            signature=signature,
+            encryption_key_id=sender_keys["id"] if encrypt and sender_keys else None,
         )
         delivered = []
         bounced = []
         seen = set()
-        for addr in all_recipients:
+        for idx, addr in enumerate(all_recipients):
             if addr in seen:
                 continue
             seen.add(addr)
@@ -407,11 +604,47 @@ class MailClient:
                 inbox_fid = self._get_folder_id(recipient["id"], "inbox")
                 if inbox_fid is None:
                     inbox_fid = self._get_or_create_folder(recipient["id"], "inbox")
-                self._insert_email_copy(
-                    message_id, user_id, from_addr, ", ".join(to_addrs), ", ".join(cc_addrs),
-                    subject, body, recipient["id"], inbox_fid, is_read=0, created_at=now,
+                recip_to_str = addr
+                recip_cc_str = ""
+                recip_body = body
+                vars = {}
+                if per_recipient_vars and addr in per_recipient_vars:
+                    vars = per_recipient_vars[addr]
+                elif per_recipient_vars and "__default__" in per_recipient_vars:
+                    vars = per_recipient_vars["__default__"]
+                if vars:
+                    recip_body = self._apply_template_vars(recip_body, vars)
+                    recip_subject = self._apply_template_vars(subject, vars)
+                else:
+                    recip_subject = subject
+                recip_signature = signature
+                if sign and sender_keys and vars:
+                    sign_data = f"{recip_subject}\n{recip_body}\n{from_addr}"
+                    recip_signature = self._sign_data(sign_data, sender_keys["private_key_pem"])
+                recip_encrypted = 0
+                recip_encryption_key_id = None
+                if encrypt:
+                    recip_keys = self._get_user_keys(recipient["id"])
+                    if recip_keys:
+                        recip_body = self._encrypt_with_public_key(recip_body, recip_keys["public_key_pem"])
+                        recip_encrypted = 1
+                        recip_encryption_key_id = recip_keys["id"]
+                    else:
+                        print(f"    Warning: No public key for {addr}, sending unencrypted.")
+                per_recip_mid = base_message_id if idx == 0 else f"{base_message_id}-{idx}"
+                email_id = self._insert_email_copy(
+                    per_recip_mid, user_id, from_addr, recip_to_str, recip_cc_str,
+                    recip_subject, recip_body, recipient["id"], inbox_fid,
+                    is_read=0, created_at=now,
                     attachments=attachments,
+                    is_encrypted=recip_encrypted,
+                    is_signed=1 if sign else 0,
+                    signature=recip_signature,
+                    encryption_key_id=recip_encryption_key_id,
                 )
+                inbox_email = self._get_email_by_id(email_id, recipient["id"])
+                if inbox_email:
+                    self._apply_rules_to_email(inbox_email, recipient["id"])
                 delivered.append(addr)
             else:
                 bounced.append(addr)
@@ -454,16 +687,19 @@ class MailClient:
 
     def _insert_email_copy(self, message_id, sender_id, from_addr, to_addrs, cc_addrs,
                            subject, body, owner_id, folder_id, is_read=0, created_at=None,
-                           attachments=None):
+                           attachments=None, is_encrypted=0, is_signed=0,
+                           signature=None, encryption_key_id=None):
         if created_at is None:
             created_at = datetime.now().isoformat()
         cursor = self.conn.execute(
             """INSERT INTO emails
                (message_id, sender_id, from_addr, to_addrs, cc_addrs, subject, body,
-                owner_id, folder_id, is_read, is_starred, created_at, deleted_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, NULL)""",
+                owner_id, folder_id, is_read, is_starred, is_encrypted, is_signed,
+                signature, encryption_key_id, created_at, deleted_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, NULL)""",
             (message_id, sender_id, from_addr, to_addrs, cc_addrs, subject, body,
-             owner_id, folder_id, is_read, created_at),
+             owner_id, folder_id, is_read, is_encrypted, is_signed,
+             signature, encryption_key_id, created_at),
         )
         email_id = cursor.lastrowid
         if attachments:
@@ -474,6 +710,691 @@ class MailClient:
                 )
         self.conn.commit()
         return email_id
+
+    def _get_user_rules(self, user_id):
+        rows = self.conn.execute(
+            "SELECT * FROM rules WHERE user_id = ? AND enabled = 1 ORDER BY priority ASC, id ASC",
+            (user_id,),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+    def _get_email_attachments_count(self, email_id):
+        row = self.conn.execute(
+            "SELECT COUNT(*) as cnt FROM attachments WHERE email_id = ?",
+            (email_id,),
+        ).fetchone()
+        return row["cnt"] if row else 0
+
+    def _rule_matches(self, rule, email, user_id):
+        if rule["cond_from"]:
+            if not fnmatch.fnmatch(email["from_addr"], rule["cond_from"]):
+                return False
+        if rule["cond_subject"]:
+            if not fnmatch.fnmatch(email["subject"], rule["cond_subject"]):
+                return False
+        if rule["cond_has_attachment"] is not None and rule["cond_has_attachment"] >= 0:
+            att_count = self._get_email_attachments_count(email["id"])
+            has_att = 1 if att_count > 0 else 0
+            if has_att != rule["cond_has_attachment"]:
+                return False
+        return True
+
+    def _apply_rule(self, rule, email, user_id):
+        action = rule["action_type"]
+        param = rule["action_param"]
+        if action == "move":
+            target_fid = self._get_or_create_folder(user_id, param)
+            self.conn.execute(
+                "UPDATE emails SET folder_id = ? WHERE id = ?",
+                (target_fid, email["id"]),
+            )
+            self.conn.commit()
+            return True, f"moved to '{param}'"
+        elif action == "star":
+            if not email["is_starred"]:
+                self.conn.execute(
+                    "UPDATE emails SET is_starred = 1 WHERE id = ?",
+                    (email["id"],),
+                )
+                starred_fid = self._get_folder_id(user_id, "starred")
+                if starred_fid:
+                    existing = self.conn.execute(
+                        "SELECT id FROM emails WHERE owner_id = ? AND folder_id = ? AND message_id = ?",
+                        (user_id, starred_fid, email["message_id"]),
+                    ).fetchone()
+                    if not existing:
+                        self._insert_email_copy(
+                            email["message_id"], email["sender_id"], email["from_addr"],
+                            email["to_addrs"], email["cc_addrs"], email["subject"], email["body"],
+                            user_id, starred_fid, is_read=email["is_read"],
+                            created_at=email["created_at"],
+                            is_encrypted=email.get("is_encrypted", 0),
+                            is_signed=email.get("is_signed", 0),
+                            signature=email.get("signature"),
+                            encryption_key_id=email.get("encryption_key_id"),
+                        )
+                self.conn.commit()
+            return True, "starred"
+        elif action == "mark_read":
+            self.conn.execute(
+                "UPDATE emails SET is_read = 1 WHERE id = ?",
+                (email["id"],),
+            )
+            self.conn.commit()
+            return True, "marked as read"
+        elif action == "delete":
+            trash_fid = self._get_or_create_folder(user_id, "trash")
+            self.conn.execute(
+                "UPDATE emails SET folder_id = ?, deleted_at = ? WHERE id = ?",
+                (trash_fid, datetime.now().isoformat(), email["id"]),
+            )
+            self.conn.commit()
+            return True, "moved to trash"
+        return False, "unknown action"
+
+    def _apply_rules_to_email(self, email, user_id):
+        rules = self._get_user_rules(user_id)
+        applied = []
+        for rule in rules:
+            if self._rule_matches(rule, email, user_id):
+                ok, result = self._apply_rule(rule, email, user_id)
+                if ok:
+                    applied.append(f"rule '{rule['name']}': {result}")
+        return applied
+
+    def _apply_rules_to_inbox(self, user_id):
+        inbox_fid = self._get_folder_id(user_id, "inbox")
+        if not inbox_fid:
+            return []
+        rows = self.conn.execute(
+            "SELECT * FROM emails WHERE owner_id = ? AND folder_id = ?",
+            (user_id, inbox_fid),
+        ).fetchall()
+        results = {}
+        for row in rows:
+            email = dict(row)
+            applied = self._apply_rules_to_email(email, user_id)
+            if applied:
+                results[email["id"]] = applied
+        return results
+
+    def do_rules(self, args):
+        if not self.current_user:
+            print("  Error: Not logged in.")
+            return
+        parts = args.strip().split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+        if subcmd == "add":
+            self._do_rules_add(rest)
+        elif subcmd == "list":
+            self._do_rules_list()
+        elif subcmd == "delete" or subcmd == "remove":
+            self._do_rules_delete(rest)
+        elif subcmd == "reorder":
+            self._do_rules_reorder(rest)
+        elif subcmd == "test":
+            self._do_rules_test()
+        else:
+            print("  Usage:")
+            print("    rules add <name> [--from <pattern>] [--subject <pattern>]")
+            print("              [--has-attachment true|false] --action <type:param>")
+            print("              (actions: move:folder, star, mark_read, delete)")
+            print("    rules list")
+            print("    rules delete <name>")
+            print("    rules reorder <name1>,<name2>,...")
+            print("    rules test")
+
+    def _parse_action(self, action_str):
+        if ":" in action_str:
+            atype, _, aparam = action_str.partition(":")
+            return atype.strip().lower(), aparam.strip()
+        return action_str.strip().lower(), None
+
+    def _do_rules_add(self, args):
+        tokens = args.strip().split()
+        if not tokens:
+            print("  Error: Specify rule name.")
+            return
+        name = tokens[0]
+        cond_from = None
+        cond_subject = None
+        cond_has_att = None
+        action_type = None
+        action_param = None
+        i = 1
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--from" and i + 1 < len(tokens):
+                cond_from = tokens[i + 1].strip('"').strip("'")
+                i += 2
+            elif tok == "--subject" and i + 1 < len(tokens):
+                cond_subject = tokens[i + 1].strip('"').strip("'")
+                i += 2
+            elif tok == "--has-attachment" and i + 1 < len(tokens):
+                val = tokens[i + 1].lower()
+                if val in ("true", "1", "yes"):
+                    cond_has_att = 1
+                elif val in ("false", "0", "no"):
+                    cond_has_att = 0
+                i += 2
+            elif tok == "--action" and i + 1 < len(tokens):
+                action_type, action_param = self._parse_action(tokens[i + 1])
+                i += 2
+            else:
+                print(f"  Unknown token: {tok}")
+                return
+        if action_type is None:
+            print("  Error: --action is required.")
+            return
+        if cond_from is None and cond_subject is None and cond_has_att is None:
+            print("  Error: At least one condition (--from, --subject, --has-attachment) is required.")
+            return
+        valid_actions = {"move", "star", "mark_read", "delete"}
+        if action_type not in valid_actions:
+            print(f"  Error: Invalid action '{action_type}'. Valid: {', '.join(valid_actions)}")
+            return
+        if action_type == "move" and not action_param:
+            print("  Error: move action requires a folder name (e.g. --action move:work)")
+            return
+        user_id = self.current_user["id"]
+        existing = self.conn.execute(
+            "SELECT id FROM rules WHERE user_id = ? AND name = ?",
+            (user_id, name),
+        ).fetchone()
+        if existing:
+            print(f"  Error: Rule '{name}' already exists.")
+            return
+        max_priority = self.conn.execute(
+            "SELECT COALESCE(MAX(priority), -1) AS mp FROM rules WHERE user_id = ?",
+            (user_id,),
+        ).fetchone()["mp"]
+        self.conn.execute(
+            """INSERT INTO rules (user_id, name, priority, cond_from, cond_subject,
+               cond_has_attachment, action_type, action_param)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, name, max_priority + 1, cond_from, cond_subject,
+             cond_has_att, action_type, action_param),
+        )
+        self.conn.commit()
+        print(f"  Rule '{name}' added.")
+        print(f"    Conditions: ", end="")
+        conds = []
+        if cond_from:
+            conds.append(f"from ~ '{cond_from}'")
+        if cond_subject:
+            conds.append(f"subject ~ '{cond_subject}'")
+        if cond_has_att is not None:
+            conds.append(f"has-attachment = {bool(cond_has_att)}")
+        print(", ".join(conds))
+        print(f"    Action: {action_type}" + (f": {action_param}" if action_param else ""))
+
+    def _do_rules_list(self):
+        user_id = self.current_user["id"]
+        rows = self.conn.execute(
+            "SELECT * FROM rules WHERE user_id = ? ORDER BY priority ASC, id ASC",
+            (user_id,),
+        ).fetchall()
+        if not rows:
+            print("  No rules defined.")
+            return
+        print(f"\n  {'#':<4} {'Name':<16} {'Conditions':<40} {'Action':<18}")
+        print("  " + "-" * 80)
+        for i, r in enumerate(rows, 1):
+            conds = []
+            if r["cond_from"]:
+                conds.append(f"from={r['cond_from']}")
+            if r["cond_subject"]:
+                conds.append(f"subj={r['cond_subject']}")
+            if r["cond_has_attachment"] is not None and r["cond_has_attachment"] >= 0:
+                conds.append(f"att={'T' if r['cond_has_attachment'] else 'F'}")
+            cond_str = ",".join(conds) if conds else "(none)"
+            act_str = r["action_type"]
+            if r["action_param"]:
+                act_str += f":{r['action_param']}"
+            print(f"  {i:<4} {r['name']:<16} {cond_str[:40]:<40} {act_str:<18}")
+        print()
+
+    def _do_rules_delete(self, args):
+        name = args.strip()
+        if not name:
+            print("  Usage: rules delete <name>")
+            return
+        user_id = self.current_user["id"]
+        existing = self.conn.execute(
+            "SELECT id FROM rules WHERE user_id = ? AND name = ?",
+            (user_id, name),
+        ).fetchone()
+        if not existing:
+            print(f"  Error: Rule '{name}' not found.")
+            return
+        self.conn.execute(
+            "DELETE FROM rules WHERE id = ?", (existing["id"],)
+        )
+        self.conn.commit()
+        print(f"  Rule '{name}' deleted.")
+
+    def _do_rules_reorder(self, args):
+        names = [n.strip() for n in args.strip().split(",") if n.strip()]
+        if not names:
+            print("  Usage: rules reorder name1,name2,...")
+            return
+        user_id = self.current_user["id"]
+        existing = {}
+        for r in self.conn.execute(
+            "SELECT id, name FROM rules WHERE user_id = ?", (user_id,)
+        ).fetchall():
+            existing[r["name"]] = r["id"]
+        for n in names:
+            if n not in existing:
+                print(f"  Error: Rule '{n}' not found.")
+                return
+        seen = set()
+        dups = [n for n in names if n in seen or seen.add(n)]
+        if dups:
+            print(f"  Error: Duplicate names in list: {', '.join(dups)}")
+            return
+        priority = 0
+        for n in names:
+            self.conn.execute(
+                "UPDATE rules SET priority = ? WHERE id = ?",
+                (priority, existing[n]),
+            )
+            priority += 1
+        remaining = [rid for name, rid in existing.items() if name not in names]
+        for rid in remaining:
+            self.conn.execute(
+                "UPDATE rules SET priority = ? WHERE id = ?",
+                (priority, rid),
+            )
+            priority += 1
+        self.conn.commit()
+        print(f"  Reordered {len(names)} rules.")
+        self._do_rules_list()
+
+    def _do_rules_test(self):
+        user_id = self.current_user["id"]
+        print("  Applying rules to all inbox emails...")
+        results = self._apply_rules_to_inbox(user_id)
+        if not results:
+            print("  No emails matched any rule.")
+            return
+        print(f"\n  Rules applied to {len(results)} emails:")
+        for eid, actions in results.items():
+            row = self.conn.execute(
+                "SELECT subject, from_addr FROM emails WHERE id = ?", (eid,)
+            ).fetchone()
+            if row:
+                print(f"    [{row['from_addr']}] {row['subject']}:")
+                for a in actions:
+                    print(f"      -> {a}")
+        print()
+
+    def _apply_template_vars(self, text, vars):
+        if not text:
+            return text
+        result = text
+        for key, value in vars.items():
+            placeholder = "{" + key + "}"
+            if placeholder in result:
+                result = result.replace(placeholder, str(value))
+        return result
+
+    def _default_template_vars(self, recipient_username=None):
+        now = datetime.now()
+        vars = {
+            "date": now.strftime("%Y-%m-%d"),
+            "datetime": now.strftime("%Y-%m-%d %H:%M:%S"),
+            "time": now.strftime("%H:%M:%S"),
+            "year": str(now.year),
+            "month": str(now.month),
+            "day": str(now.day),
+            "domain": DOMAIN,
+        }
+        if recipient_username:
+            vars["name"] = recipient_username
+            vars["email"] = self._email_addr(recipient_username)
+        if self.current_user:
+            vars["sender"] = self.current_user["username"]
+            vars["sender_email"] = self._email_addr(self.current_user["username"])
+        return vars
+
+    def do_template(self, args):
+        if not self.current_user:
+            print("  Error: Not logged in.")
+            return
+        parts = args.strip().split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+        if subcmd == "add":
+            self._do_template_add(rest)
+        elif subcmd == "list":
+            self._do_template_list()
+        elif subcmd == "use":
+            self._do_template_use(rest)
+        elif subcmd == "delete" or subcmd == "remove":
+            self._do_template_delete(rest)
+        else:
+            print("  Usage:")
+            print("    template add <name>       Create/edit a template (editor mode)")
+            print("    template list             List all templates")
+            print("    template use <name>       Compose using a template (vars auto-filled)")
+            print("    template delete <name>    Delete a template")
+
+    def _do_template_add(self, args):
+        name = args.strip()
+        if not name:
+            print("  Error: Specify template name.")
+            return
+        print(f"  Editing template: {name}")
+        print("  Enter Subject (empty to skip):")
+        subject = input("  > ").strip()
+        print("  Enter Body (end with '.' on a single line):")
+        body_lines = []
+        while True:
+            try:
+                line = input("  > ")
+            except EOFError:
+                break
+            if line == ".":
+                break
+            body_lines.append(line)
+        body = "\n".join(body_lines)
+        user_id = self.current_user["id"]
+        existing = self.conn.execute(
+            "SELECT id FROM templates WHERE user_id = ? AND name = ?",
+            (user_id, name),
+        ).fetchone()
+        now = datetime.now().isoformat()
+        if existing:
+            self.conn.execute(
+                "UPDATE templates SET subject = ?, body = ? WHERE id = ?",
+                (subject, body, existing["id"]),
+            )
+            self.conn.commit()
+            print(f"  Template '{name}' updated.")
+        else:
+            self.conn.execute(
+                "INSERT INTO templates (user_id, name, subject, body, created_at) VALUES (?, ?, ?, ?, ?)",
+                (user_id, name, subject, body, now),
+            )
+            self.conn.commit()
+            print(f"  Template '{name}' created.")
+        if subject:
+            print(f"    Subject: {subject}")
+        if body:
+            print(f"    Body ({len(body_lines)} lines)")
+
+    def _do_template_list(self):
+        user_id = self.current_user["id"]
+        rows = self.conn.execute(
+            "SELECT * FROM templates WHERE user_id = ? ORDER BY name ASC",
+            (user_id,),
+        ).fetchall()
+        if not rows:
+            print("  No templates defined.")
+            return
+        print(f"\n  {'Name':<20} {'Subject':<40} {'Body Lines':>10} {'Created':<16}")
+        print("  " + "-" * 88)
+        for r in rows:
+            line_count = len(r["body"].split("\n")) if r["body"] else 0
+            created = r["created_at"][:16]
+            print(f"  {r['name']:<20} {r['subject'][:40]:<40} {line_count:>10} {created:<16}")
+        print()
+
+    def _get_template_by_name(self, user_id, name):
+        row = self.conn.execute(
+            "SELECT * FROM templates WHERE user_id = ? AND name = ?",
+            (user_id, name),
+        ).fetchone()
+        return dict(row) if row else None
+
+    def _do_template_use(self, args):
+        name = args.strip()
+        if not name:
+            print("  Usage: template use <name>")
+            return
+        user_id = self.current_user["id"]
+        tmpl = self._get_template_by_name(user_id, name)
+        if not tmpl:
+            print(f"  Error: Template '{name}' not found.")
+            return
+        vars = self._default_template_vars()
+        subject = self._apply_template_vars(tmpl["subject"], vars)
+        body = self._apply_template_vars(tmpl["body"], vars)
+        print(f"  Using template: {name}")
+        print("  Compose new email (pre-filled from template)")
+        to_input = input("  To: ").strip()
+        if to_input.lower() == "cancel":
+            print("  Compose cancelled.")
+            return
+        cc_input = input("  CC: ").strip()
+        if cc_input.lower() == "cancel":
+            print("  Compose cancelled.")
+            return
+        subject_default = subject if subject else ""
+        subject_input = input(f"  Subject [{subject_default}]: ").strip()
+        if subject_input.lower() == "cancel":
+            print("  Compose cancelled.")
+            return
+        final_subject = subject_input if subject_input else subject_default
+        print("  Body (end with '.' on a single line; '.' alone uses template body):")
+        print(f"  --- Template body preview ---")
+        for line in body.split("\n")[:5]:
+            print(f"  > {line}")
+        if len(body.split("\n")) > 5:
+            print(f"  > ... ({len(body.split(chr(10))) - 5} more lines)")
+        print(f"  -----------------------------")
+        body_lines = []
+        while True:
+            try:
+                line = input("  > ")
+            except EOFError:
+                break
+            if line == ".":
+                break
+            body_lines.append(line)
+        final_body = "\n".join(body_lines) if body_lines else body
+        attachments = []
+        attach_input = input("  Attachments (file paths, comma-separated; Enter to skip): ").strip()
+        if attach_input.lower() == "cancel":
+            print("  Compose cancelled.")
+            return
+        if attach_input:
+            for fpath in attach_input.split(","):
+                fpath = fpath.strip().strip("'\"")
+                if not fpath:
+                    continue
+                if not os.path.isfile(fpath):
+                    print(f"    File not found, skipped: {fpath}")
+                    continue
+                try:
+                    with open(fpath, "rb") as f:
+                        data = f.read()
+                    b64 = base64.b64encode(data).decode("utf-8")
+                    fname = os.path.basename(fpath)
+                    attachments.append({"filename": fname, "data_base64": b64, "size": len(data)})
+                    print(f"    Attached: {fname} ({self._fmt_size(len(data))})")
+                except Exception as e:
+                    print(f"    Error reading file, skipped: {fpath} ({e})")
+        self._send_email(to_input, cc_input, final_subject, final_body, attachments)
+
+    def _do_template_delete(self, args):
+        name = args.strip()
+        if not name:
+            print("  Usage: template delete <name>")
+            return
+        user_id = self.current_user["id"]
+        existing = self.conn.execute(
+            "SELECT id FROM templates WHERE user_id = ? AND name = ?",
+            (user_id, name),
+        ).fetchone()
+        if not existing:
+            print(f"  Error: Template '{name}' not found.")
+            return
+        self.conn.execute("DELETE FROM templates WHERE id = ?", (existing["id"],))
+        self.conn.commit()
+        print(f"  Template '{name}' deleted.")
+
+    def do_broadcast(self, args):
+        if not self.current_user:
+            print("  Error: Not logged in.")
+            return
+        user_id = self.current_user["id"]
+        tokens = args.strip().split()
+        if not tokens:
+            print("  Usage:")
+            print("    broadcast --to-all [--template <name>]")
+            print("    broadcast --to \"user1,user2,...\" [--template <name>]")
+            return
+        to_all = False
+        to_list = []
+        template_name = None
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--to-all":
+                to_all = True
+                i += 1
+            elif tok == "--to" and i + 1 < len(tokens):
+                raw = tokens[i + 1].strip('"').strip("'")
+                to_list = [u.strip() for u in raw.split(",") if u.strip()]
+                i += 2
+            elif tok == "--template" and i + 1 < len(tokens):
+                template_name = tokens[i + 1]
+                i += 2
+            else:
+                print(f"  Unknown token: {tok}")
+                return
+        recipients = []
+        if to_all:
+            rows = self.conn.execute(
+                "SELECT id, username FROM users WHERE id != ?", (user_id,)
+            ).fetchall()
+            recipients = [(dict(r)["username"], dict(r)["id"]) for r in rows]
+        elif to_list:
+            for uname in to_list:
+                user = self._get_user_by_username(uname)
+                if user:
+                    recipients.append((user["username"], user["id"]))
+                else:
+                    print(f"  Warning: User '{uname}' not found, skipped.")
+        else:
+            print("  Error: Specify --to-all or --to.")
+            return
+        if not recipients:
+            print("  Error: No valid recipients.")
+            return
+        tmpl = None
+        if template_name:
+            tmpl = self._get_template_by_name(user_id, template_name)
+            if not tmpl:
+                print(f"  Error: Template '{template_name}' not found.")
+                return
+        if tmpl:
+            print(f"  Composing broadcast from template: {template_name}")
+            print(f"  Recipients: {', '.join(r[0] for r in recipients)}")
+            print("  Confirm sending? (y/n): ", end="")
+            confirm = input().strip().lower()
+            if confirm not in ("y", "yes"):
+                print("  Broadcast cancelled.")
+                return
+            template_subject = tmpl["subject"]
+            template_body = tmpl["body"]
+            per_recipient_vars = {}
+            for username, uid in recipients:
+                addr = self._email_addr(username)
+                vars = self._default_template_vars(recipient_username=username)
+                per_recipient_vars[addr] = vars
+            to_str = ",".join(self._email_addr(r[0]) for r in recipients)
+            self._send_email(
+                to_str, "", template_subject, template_body, [],
+                encrypt=False, sign=False,
+                per_recipient_vars=per_recipient_vars,
+            )
+            print(f"  Broadcast sent to {len(recipients)} recipients.")
+        else:
+            print(f"  Composing broadcast email to {len(recipients)} recipients.")
+            print("  Enter Subject:")
+            subject = input("  > ").strip()
+            print("  Enter Body (end with '.' on a single line):")
+            body_lines = []
+            while True:
+                try:
+                    line = input("  > ")
+                except EOFError:
+                    break
+                if line == ".":
+                    break
+                body_lines.append(line)
+            body = "\n".join(body_lines)
+            per_recipient_vars = {}
+            for username, uid in recipients:
+                addr = self._email_addr(username)
+                vars = self._default_template_vars(recipient_username=username)
+                per_recipient_vars[addr] = vars
+            to_str = ",".join(self._email_addr(r[0]) for r in recipients)
+            print(f"  Confirm sending to {len(recipients)} recipients? (y/n): ", end="")
+            confirm = input().strip().lower()
+            if confirm not in ("y", "yes"):
+                print("  Broadcast cancelled.")
+                return
+            self._send_email(
+                to_str, "", subject, body, [],
+                encrypt=False, sign=False,
+                per_recipient_vars=per_recipient_vars,
+            )
+            print(f"  Broadcast sent.")
+
+    def do_keys(self, args):
+        if not self.current_user:
+            print("  Error: Not logged in.")
+            return
+        parts = args.strip().split(maxsplit=1)
+        subcmd = parts[0].lower() if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+        if subcmd == "show":
+            self._do_keys_show()
+        elif subcmd == "export":
+            self._do_keys_export(rest)
+        elif subcmd == "import":
+            print("  Note: Your own key pair is auto-generated. Import not required for personal use.")
+        else:
+            print("  Usage:")
+            print("    keys show                 Show your key fingerprint")
+            print("    keys export [file.pub]    Export your public key")
+
+    def _do_keys_show(self):
+        user_id = self.current_user["id"]
+        keys = self._get_user_keys(user_id)
+        if not keys:
+            print("  Error: No keys found. This should not happen.")
+            return
+        fp = keys["key_fingerprint"]
+        fp_colon = ":".join(fp[i:i+2] for i in range(0, len(fp), 2))
+        print(f"\n  Key Fingerprint (SHA256):")
+        print(f"  {fp_colon}")
+        print(f"  Key created: {keys['created_at'][:19]}")
+        print(f"  Public key size: {RSA_KEY_SIZE} bits (RSA)")
+        print()
+
+    def _do_keys_export(self, args):
+        output_path = args.strip()
+        user_id = self.current_user["id"]
+        keys = self._get_user_keys(user_id)
+        if not keys:
+            print("  Error: No keys found.")
+            return
+        default_name = f"{self.current_user['username']}_public_key.pem"
+        if not output_path:
+            output_path = default_name
+        try:
+            with open(output_path, "w") as f:
+                f.write(keys["public_key_pem"])
+            print(f"  Public key exported to: {output_path}")
+            print(f"  Fingerprint: {keys['key_fingerprint'][:16]}...")
+        except Exception as e:
+            print(f"  Error exporting key: {e}")
 
     def _get_folder_emails(self, user_id, folder_name, order_by="date_desc"):
         fid = self._get_folder_id(user_id, folder_name)
@@ -558,16 +1479,19 @@ class MailClient:
             print("  (empty)")
             print()
             return
-        print(f"  {'#':<4} {'Read':<5} {'Star':<5} {'From':<24} {'Subject':<30} {'Date':<12} {'Att':<3}")
-        print("  " + "-" * 88)
+        print(f"  {'#':<4} {'Read':<5} {'Star':<5} {'Enc':<4} {'From':<24} {'Subject':<30} {'Date':<12} {'Att':<3}")
+        print("  " + "-" * 92)
         for i, e in enumerate(emails, 1):
             read_mark = " " if e["is_read"] else "\u2605"
             star_mark = "\u2605" if e["is_starred"] else " "
+            enc_mark = "E" if e["is_encrypted"] else " "
             from_addr = e["from_addr"][:22]
             subject = e["subject"][:28]
+            if e["is_encrypted"]:
+                subject = "[加密]" + subject[:22]
             date_str = e["created_at"][:10]
             att_mark = "+" if e["attachment_count"] > 0 else " "
-            print(f"  {i:<4} {read_mark:<5} {star_mark:<5} {from_addr:<24} {subject:<30} {date_str:<12} {att_mark:<3}")
+            print(f"  {i:<4} {read_mark:<5} {star_mark:<5} {enc_mark:<4} {from_addr:<24} {subject:<30} {date_str:<12} {att_mark:<3}")
         print()
 
     def do_read(self, args):
@@ -597,6 +1521,10 @@ class MailClient:
         print(f"  Subject : {email['subject']}")
         print(f"  Date    : {email['created_at'][:19]}")
         print(f"  Starred : {'Yes' if email['is_starred'] else 'No'}")
+        if email["is_encrypted"]:
+            print("  加密    : 是 [加密]")
+        if email["is_signed"]:
+            print("  签名    : 是")
         atts = self.conn.execute(
             "SELECT id, filename, size FROM attachments WHERE email_id = ?",
             (email["id"],),
@@ -606,7 +1534,30 @@ class MailClient:
             for a in atts:
                 print(f"    - {a['filename']} ({self._fmt_size(a['size'])})")
         print("  " + "-" * 60)
-        for line in email["body"].split("\n"):
+        display_body = email["body"]
+        if email["is_encrypted"]:
+            my_keys = self._get_user_keys(user_id)
+            if my_keys:
+                decrypted = self._decrypt_with_private_key(display_body, my_keys["private_key_pem"])
+                if decrypted is not None:
+                    display_body = decrypted
+                    print("  [邮件已解密]")
+                else:
+                    print("  [解密失败 - 无法读取加密内容]")
+            else:
+                print("  [无私钥 - 无法解密]")
+        if email["is_signed"] and email["signature"] and email["sender_id"]:
+            sender_keys = self._get_user_keys(email["sender_id"])
+            if sender_keys:
+                sign_data = f"{email['subject']}\n{display_body}\n{email['from_addr']}"
+                valid = self._verify_signature(sign_data, email["signature"], sender_keys["public_key_pem"])
+                if valid:
+                    print("  ✓ 签名验证通过")
+                else:
+                    print("  ✗ 签名验证失败")
+            else:
+                print("  [无法验证签名 - 未找到发件人公钥]")
+        for line in display_body.split("\n"):
             print(f"  {line}")
         print("  " + "-" * 60)
         print()
@@ -1023,9 +1974,9 @@ class MailClient:
     whoami                    Show current user info
 
   Email:
-    compose                   Compose a new email
+    compose [--encrypt] [--sign]  Compose a new email (with optional encryption/signing)
     inbox [folder]            List emails in current/specified folder
-    read <num>                Read an email
+    read <num>                Read an email (auto-decrypt/verify)
     delete <num>              Delete an email (move to trash)
     star <num>                Toggle star on an email
     mark <num> <read|unread>  Mark email as read/unread
@@ -1044,6 +1995,29 @@ class MailClient:
   Attachments:
     attachments <num>         List attachments of an email
     save-attachment <num> <att#|path>  Save attachment to disk
+
+  Rules (Auto-classification):
+    rules add <name> --from <pattern> --subject <pattern>
+           --has-attachment true|false --action <type:param>
+                              Add a rule (actions: move:folder, star, mark_read, delete)
+    rules list                List all rules
+    rules delete <name>       Delete a rule
+    rules reorder <n1,n2,...> Reorder rule priorities
+    rules test                Re-apply rules to inbox emails
+
+  Templates & Broadcast:
+    template add <name>       Create/edit a template (supports {name}/{date} vars)
+    template list             List all templates
+    template use <name>       Compose using a template
+    template delete <name>    Delete a template
+    broadcast --to-all [--template <name>]   Send to all users
+    broadcast --to "u1,u2" [--template <name>]  Send to specific users
+
+  Encryption & Signing:
+    keys show                 Show your public key fingerprint
+    keys export [file.pub]    Export your public key
+    compose --encrypt         Encrypt email with recipient's public key
+    compose --sign            Sign email with your private key
 
   Other:
     help                      Show this help
@@ -1109,6 +2083,10 @@ class MailClient:
                 "sort": self.do_sort,
                 "attachments": self.do_attachments,
                 "save-attachment": self.do_save_attachment,
+                "rules": self.do_rules,
+                "template": self.do_template,
+                "broadcast": self.do_broadcast,
+                "keys": self.do_keys,
                 "help": self.do_help,
                 "quit": self.do_quit,
                 "exit": self.do_exit,
